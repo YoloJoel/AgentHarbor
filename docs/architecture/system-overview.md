@@ -40,6 +40,25 @@ than editing history; outstanding tasks are marked `review_required` until
 their impact is resolved. The event stream records analysis, version creation,
 and freezing for audit and recovery.
 
+## Context and artifact lifecycle
+
+Contexts are isolated by purpose: every requirement owns specification context, the lead owns
+coordination context, and each worker owns task context. Full conversation history is never copied
+between them by default. Each context has a non-compressible core containing the specification
+version, acceptance criteria, architecture decisions, prohibitions, task boundary, branch, and
+workspace, plus a compressible working section.
+
+Large sources, command output, test logs, external material, Git diffs, and raw chat histories are
+stored as SHA-256-addressed artifacts. Messages retain only a reference, summary, hash, size, and
+optional relevant line range. Before compaction, the complete raw history is retained as an
+artifact and a structured checkpoint records completed work, modified files, decisions, failures,
+open questions, next steps, Git status, and HEAD. The checkpoint never replaces the raw data.
+
+Model-specific context budgets subtract response reservation and a safety margin from the model
+window, and trigger checkpoints at a configurable soft threshold. Recovery loads only the scoped
+core, latest checkpoint, current task, explicitly relevant artifacts, and latest Git diff. It
+refuses to resume when the active specification id/hash or workspace HEAD no longer matches.
+
 ## Failure recovery
 
 The orchestrator writes workspace metadata, approvals, and session state using
