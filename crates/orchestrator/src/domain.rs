@@ -67,10 +67,7 @@ macro_rules! entity {
 entity!(Project { name: String });
 entity!(Requirement { project_id: EntityId, title: String, state: RequirementState, confirmed_at: Option<String> });
 entity!(Clarification { requirement_id: EntityId, question: String, answer: Option<String> });
-entity!(Task {
-    requirement_id: EntityId,
-    title: String
-});
+entity!(Task { requirement_id: EntityId, title: String, specification_version_id: EntityId, specification_hash: String, specification_change_impact: Option<String> });
 entity!(AgentRole {
     project_id: EntityId,
     name: String,

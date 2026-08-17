@@ -6,9 +6,22 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{AgentRunAttempt, AttemptStatus, OrchestratorError, RequirementState, Result};
+use crate::{
+    specification_markdown, write_specification, AgentRunAttempt, AttemptStatus, OrchestratorError,
+    RequirementSpecification, RequirementState, Result,
+};
+
+#[derive(Clone, Debug)]
+pub struct FrozenSpecification {
+    pub id: Uuid,
+    pub requirement_id: Uuid,
+    pub version: i64,
+    pub hash: String,
+    pub document_path: PathBuf,
+}
 
 pub trait StateStore {
     fn save<T: Serialize>(&self, name: &str, value: &T) -> Result<()>;
@@ -79,10 +92,22 @@ impl SqliteStateStore {
     }
 
     fn migrate(&self) -> Result<()> {
-        self.connection
-            .lock()
-            .expect("database lock poisoned")
-            .execute_batch(SCHEMA)?;
+        let connection = self.connection.lock().expect("database lock poisoned");
+        connection.execute_batch(SCHEMA)?;
+        // The initial prototype pre-dated structured specifications. Keep local databases
+        // upgradeable instead of relying on CREATE TABLE IF NOT EXISTS to reshape them.
+        ensure_column(
+            &connection,
+            "requirements",
+            "active_specification_id",
+            "TEXT",
+        )?;
+        ensure_column(&connection, "clarifications", "analysis_id", "TEXT")?;
+        ensure_column(&connection, "clarifications", "question_key", "TEXT")?;
+        ensure_column(&connection, "clarifications", "priority", "TEXT")?;
+        ensure_column(&connection, "tasks", "specification_version_id", "TEXT")?;
+        ensure_column(&connection, "tasks", "specification_hash", "TEXT")?;
+        ensure_column(&connection, "tasks", "specification_change_impact", "TEXT")?;
         Ok(())
     }
 
@@ -136,6 +161,215 @@ impl SqliteStateStore {
         }
         append_event(&tx, "requirement", id, "requirement.confirmed", &json!({}))?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Creates a new, mutable specification version and its version-controlled Markdown file.
+    /// Existing versions are never overwritten.
+    pub fn create_specification_version(
+        &self,
+        requirement_id: Uuid,
+        project_root: impl AsRef<Path>,
+        specification: &RequirementSpecification,
+    ) -> Result<i64> {
+        specification.validate()?;
+        let mut connection = self.connection.lock().expect("database lock poisoned");
+        let tx = connection.transaction()?;
+        let version: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(version),0)+1 FROM requirement_specifications WHERE requirement_id=?1",
+            [requirement_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT id FROM requirement_specifications WHERE requirement_id=?1 ORDER BY version DESC LIMIT 1",
+                [requirement_id.to_string()],
+                |row| row.get(0),
+            )
+            .ok();
+        let markdown = specification_markdown(requirement_id, version, specification);
+        let relative =
+            write_specification(project_root.as_ref(), requirement_id, version, &markdown)?;
+        let id = Uuid::new_v4();
+        tx.execute(
+            "INSERT INTO requirement_specifications(id,requirement_id,version,status,document_path,goal,background,in_scope,out_of_scope,constraints,assumptions,user_scenarios,acceptance_criteria,risks,open_questions,supersedes_id)
+             VALUES(?1,?2,?3,'draft',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            params![id.to_string(), requirement_id.to_string(), version, relative.to_string_lossy(), specification.goal, specification.background,
+                json_text(&specification.in_scope)?, json_text(&specification.out_of_scope)?, json_text(&specification.constraints)?,
+                json_text(&specification.assumptions)?, json_text(&specification.user_scenarios)?, json_text(&specification.acceptance_criteria)?,
+                json_text(&specification.risks)?, json_text(&specification.open_questions)?, previous],
+        )?;
+        if version > 1 {
+            tx.execute(
+                "UPDATE tasks SET specification_change_impact='review_required' WHERE requirement_id=?1 AND status!='completed'",
+                [requirement_id.to_string()],
+            )?;
+        }
+        append_event(
+            &tx,
+            "requirement",
+            requirement_id,
+            "requirement.specification_version_created",
+            &json!({"specification_id":id,"version":version,"supersedes_id":previous}),
+        )?;
+        tx.commit()?;
+        Ok(version)
+    }
+
+    pub fn record_repository_analysis(
+        &self,
+        requirement_id: Uuid,
+        analysis: &crate::RepositoryAnalysis,
+    ) -> Result<Uuid> {
+        let mut connection = self.connection.lock().expect("database lock poisoned");
+        let tx = connection.transaction()?;
+        let id = Uuid::new_v4();
+        tx.execute(
+            "INSERT INTO repository_analyses(id,requirement_id,known_facts,reasonable_inferences,questions) VALUES(?1,?2,?3,?4,?5)",
+            params![id.to_string(), requirement_id.to_string(), json_text(&analysis.known_facts)?, json_text(&analysis.reasonable_inferences)?, json_text(&analysis.questions_for_user)?],
+        )?;
+        for question in &analysis.questions_for_user {
+            tx.execute(
+                "INSERT INTO clarifications(id,requirement_id,analysis_id,question_key,priority,question) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![Uuid::new_v4().to_string(), requirement_id.to_string(), id.to_string(), question.key, format!("{:?}", question.priority).to_lowercase(), question.question],
+            )?;
+        }
+        append_event(
+            &tx,
+            "requirement",
+            requirement_id,
+            "requirement.repository_analyzed",
+            &json!({"analysis_id":id,"question_count":analysis.questions_for_user.len()}),
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Freezes the confirmed version, hashes the exact Markdown artifact, and makes it the
+    /// requirement's sole active version. Plans, tasks, and acceptance records bind to this id/hash.
+    pub fn freeze_specification(
+        &self,
+        requirement_id: Uuid,
+        version: i64,
+        project_root: impl AsRef<Path>,
+    ) -> Result<FrozenSpecification> {
+        let mut connection = self.connection.lock().expect("database lock poisoned");
+        let tx = connection.transaction()?;
+        let confirmed: Option<String> = tx.query_row(
+            "SELECT confirmed_at FROM requirements WHERE id=?1",
+            [requirement_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if confirmed.is_none() {
+            return Err(OrchestratorError::InvalidInput(
+                "user confirmation is required before freezing a specification".into(),
+            ));
+        }
+        let (id, status, document_path): (String, String, String) = tx.query_row(
+            "SELECT id,status,document_path FROM requirement_specifications WHERE requirement_id=?1 AND version=?2",
+            params![requirement_id.to_string(), version],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if status != "draft" {
+            return Err(OrchestratorError::InvalidInput(
+                "only a draft specification can be frozen".into(),
+            ));
+        }
+        let path = project_root.as_ref().join(&document_path);
+        let draft = fs::read_to_string(&path)?;
+        let frozen = draft.replacen("- Status: draft", "- Status: frozen", 1);
+        fs::write(&path, frozen.as_bytes())?;
+        let hash = format!("sha256:{:x}", Sha256::digest(frozen.as_bytes()));
+        tx.execute("UPDATE requirement_specifications SET status='superseded' WHERE requirement_id=?1 AND status='frozen'", [requirement_id.to_string()])?;
+        tx.execute("UPDATE requirement_specifications SET status='frozen',spec_hash=?3,frozen_at=CURRENT_TIMESTAMP WHERE requirement_id=?1 AND version=?2",
+            params![requirement_id.to_string(), version, hash])?;
+        tx.execute("UPDATE requirements SET active_specification_id=?2,updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+            params![requirement_id.to_string(), id])?;
+        let parsed_id = parse_uuid(&id)?;
+        append_event(
+            &tx,
+            "requirement",
+            requirement_id,
+            "requirement.specification_frozen",
+            &json!({"specification_id":parsed_id,"version":version,"hash":hash}),
+        )?;
+        tx.commit()?;
+        Ok(FrozenSpecification {
+            id: parsed_id,
+            requirement_id,
+            version,
+            hash,
+            document_path: PathBuf::from(document_path),
+        })
+    }
+
+    pub fn create_task_for_specification(
+        &self,
+        id: Uuid,
+        requirement_id: Uuid,
+        title: &str,
+    ) -> Result<()> {
+        let mut connection = self.connection.lock().expect("database lock poisoned");
+        let tx = connection.transaction()?;
+        let (spec_id, hash): (String, String) = tx.query_row(
+            "SELECT s.id,s.spec_hash FROM requirements r JOIN requirement_specifications s ON s.id=r.active_specification_id WHERE r.id=?1 AND s.status='frozen'",
+            [requirement_id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        tx.execute("INSERT INTO tasks(id,requirement_id,title,specification_version_id,specification_hash) VALUES(?1,?2,?3,?4,?5)",
+            params![id.to_string(), requirement_id.to_string(), title, spec_id, hash])?;
+        append_event(
+            &tx,
+            "task",
+            id,
+            "task.created",
+            &json!({"specification_version_id":spec_id,"specification_hash":hash}),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn record_execution_plan(&self, id: Uuid, requirement_id: Uuid, body: &str) -> Result<()> {
+        self.insert_spec_reference("execution_plans", id, requirement_id, "body", body)
+    }
+
+    pub fn record_final_acceptance(
+        &self,
+        id: Uuid,
+        requirement_id: Uuid,
+        evidence: &str,
+    ) -> Result<()> {
+        self.insert_spec_reference(
+            "acceptance_records",
+            id,
+            requirement_id,
+            "evidence",
+            evidence,
+        )
+    }
+
+    fn insert_spec_reference(
+        &self,
+        table: &str,
+        id: Uuid,
+        requirement_id: Uuid,
+        field: &str,
+        value: &str,
+    ) -> Result<()> {
+        let connection = self.connection.lock().expect("database lock poisoned");
+        let (spec_id, hash): (String, String) = connection.query_row(
+            "SELECT s.id,s.spec_hash FROM requirements r JOIN requirement_specifications s ON s.id=r.active_specification_id WHERE r.id=?1 AND s.status='frozen'",
+            [requirement_id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        // Table and field are private constants chosen by the two callers above.
+        let sql = format!("INSERT INTO {table}(id,requirement_id,{field},specification_version_id,specification_hash) VALUES(?1,?2,?3,?4,?5)");
+        connection.execute(
+            &sql,
+            params![
+                id.to_string(),
+                requirement_id.to_string(),
+                value,
+                spec_id,
+                hash
+            ],
+        )?;
         Ok(())
     }
 
@@ -294,6 +528,21 @@ fn parse_uuid(value: &str) -> Result<Uuid> {
     Uuid::parse_str(value)
         .map_err(|_| OrchestratorError::InvalidInput("invalid persisted UUID".into()))
 }
+fn json_text<T: Serialize>(value: &T) -> Result<String> {
+    Ok(serde_json::to_string(value)?)
+}
+fn ensure_column(connection: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(());
+        }
+    }
+    // All identifiers and types are private constants from migrate(), never external input.
+    connection.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+    Ok(())
+}
 fn parse_requirement_state(value: &str) -> Result<RequirementState> {
     Ok(match value {
         "draft" => RequirementState::Draft,
@@ -316,9 +565,14 @@ fn parse_requirement_state(value: &str) -> Result<RequirementState> {
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS requirements(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),title TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('draft','clarifying','ready','planning','executing','integrating','verifying','completed','failed','paused')),confirmed_at TEXT,execution_skip_reason TEXT,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS clarifications(id TEXT PRIMARY KEY,requirement_id TEXT NOT NULL REFERENCES requirements(id),question TEXT NOT NULL,answer TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,requirement_id TEXT NOT NULL REFERENCES requirements(id),title TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending');
+CREATE TABLE IF NOT EXISTS requirements(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),title TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('draft','clarifying','ready','planning','executing','integrating','verifying','completed','failed','paused')),confirmed_at TEXT,execution_skip_reason TEXT,active_specification_id TEXT,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS repository_analyses(id TEXT PRIMARY KEY,requirement_id TEXT NOT NULL REFERENCES requirements(id),known_facts TEXT NOT NULL,reasonable_inferences TEXT NOT NULL,questions TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS clarifications(id TEXT PRIMARY KEY,requirement_id TEXT NOT NULL REFERENCES requirements(id),analysis_id TEXT REFERENCES repository_analyses(id),question_key TEXT,priority TEXT,question TEXT NOT NULL,answer TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS requirement_specifications(id TEXT PRIMARY KEY,requirement_id TEXT NOT NULL REFERENCES requirements(id),version INTEGER NOT NULL,status TEXT NOT NULL CHECK(status IN ('draft','frozen','superseded')),document_path TEXT NOT NULL,goal TEXT NOT NULL,background TEXT NOT NULL,in_scope TEXT NOT NULL,out_of_scope TEXT NOT NULL,constraints TEXT NOT NULL,assumptions TEXT NOT NULL,user_scenarios TEXT NOT NULL,acceptance_criteria TEXT NOT NULL,risks TEXT NOT NULL,open_questions TEXT NOT NULL,spec_hash TEXT,frozen_at TEXT,supersedes_id TEXT REFERENCES requirement_specifications(id),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,UNIQUE(requirement_id,version));
+CREATE UNIQUE INDEX IF NOT EXISTS one_frozen_specification_per_requirement ON requirement_specifications(requirement_id) WHERE status='frozen';
+CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,requirement_id TEXT NOT NULL REFERENCES requirements(id),title TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',specification_version_id TEXT NOT NULL REFERENCES requirement_specifications(id),specification_hash TEXT NOT NULL,specification_change_impact TEXT);
+CREATE TABLE IF NOT EXISTS execution_plans(id TEXT PRIMARY KEY,requirement_id TEXT NOT NULL REFERENCES requirements(id),body TEXT NOT NULL,specification_version_id TEXT NOT NULL REFERENCES requirement_specifications(id),specification_hash TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS acceptance_records(id TEXT PRIMARY KEY,requirement_id TEXT NOT NULL REFERENCES requirements(id),evidence TEXT NOT NULL,specification_version_id TEXT NOT NULL REFERENCES requirement_specifications(id),specification_hash TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS agent_roles(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),name TEXT NOT NULL,instructions TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),repository_path TEXT NOT NULL,worktree_path TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS agent_runs(id TEXT PRIMARY KEY,agent_role_id TEXT NOT NULL REFERENCES agent_roles(id),task_id TEXT NOT NULL REFERENCES tasks(id),workspace_id TEXT NOT NULL REFERENCES workspaces(id),recovery_policy TEXT NOT NULL DEFAULT 'resume');
@@ -331,3 +585,93 @@ CREATE TABLE IF NOT EXISTS events(sequence INTEGER PRIMARY KEY AUTOINCREMENT,ent
 CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT,'events are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT,'events are append-only'); END;
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_spec(goal: &str) -> RequirementSpecification {
+        RequirementSpecification {
+            goal: goal.into(),
+            background: "Operators need an auditable delivery contract.".into(),
+            in_scope: vec!["Persist a structured specification.".into()],
+            out_of_scope: vec!["Agent implementation details.".into()],
+            constraints: vec!["Do not mutate frozen versions.".into()],
+            assumptions: vec!["The project uses Git.".into()],
+            user_scenarios: vec!["A lead confirms a specification before work starts.".into()],
+            acceptance_criteria: vec!["Every task references a frozen hash.".into()],
+            risks: vec!["Stale tasks may target an older version.".into()],
+            open_questions: vec![],
+        }
+    }
+
+    #[test]
+    fn freezes_versions_and_marks_tasks_impacted_by_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteStateStore::open(directory.path().join("state.db")).unwrap();
+        let project = Uuid::new_v4();
+        let requirement = Uuid::new_v4();
+        store.create_project(project, "harbor").unwrap();
+        store
+            .create_requirement(requirement, project, "version specifications")
+            .unwrap();
+        let first = store
+            .create_specification_version(
+                requirement,
+                directory.path(),
+                &sample_spec("Ship safely"),
+            )
+            .unwrap();
+        assert_eq!(first, 1);
+        assert!(store
+            .freeze_specification(requirement, first, directory.path())
+            .is_err());
+        store.confirm_requirement(requirement).unwrap();
+        let frozen = store
+            .freeze_specification(requirement, first, directory.path())
+            .unwrap();
+        assert!(frozen.hash.starts_with("sha256:"));
+        assert!(directory.path().join(&frozen.document_path).exists());
+
+        let task = Uuid::new_v4();
+        store
+            .create_task_for_specification(task, requirement, "implement")
+            .unwrap();
+        let second = store
+            .create_specification_version(
+                requirement,
+                directory.path(),
+                &sample_spec("Ship more safely"),
+            )
+            .unwrap();
+        assert_eq!(second, 2);
+        let impact: String = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT specification_change_impact FROM tasks WHERE id=?1",
+                [task.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(impact, "review_required");
+    }
+
+    #[test]
+    fn analysis_questions_put_architecture_before_acceptance() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("Cargo.toml"), "[workspace]").unwrap();
+        fs::write(directory.path().join("package.json"), "{}").unwrap();
+        let analysis = crate::analyze_repository(directory.path()).unwrap();
+        assert!(analysis.known_facts.len() >= 2);
+        assert_eq!(
+            analysis.questions_for_user[0].priority,
+            crate::QuestionPriority::Architecture
+        );
+        assert_eq!(
+            analysis.questions_for_user[2].priority,
+            crate::QuestionPriority::Acceptance
+        );
+    }
+}

@@ -21,6 +21,38 @@ export type Command =
   | { type: "session.cancel"; sessionId: string }
   | { type: "approval.resolve"; approvalId: string; decision: "allow-once" | "deny" };
 
+export interface RequirementSpecification {
+  goal: string;
+  background: string;
+  inScope: string[];
+  outOfScope: string[];
+  constraints: string[];
+  assumptions: string[];
+  userScenarios: string[];
+  acceptanceCriteria: string[];
+  risks: string[];
+  openQuestions: string[];
+}
+
+export interface AnalysisQuestion {
+  key: string;
+  question: string;
+  priority: "architecture" | "acceptance" | "delivery";
+  rationale: string;
+}
+
+export interface RepositoryAnalysis {
+  knownFacts: string[];
+  reasonableInferences: string[];
+  questionsForUser: AnalysisQuestion[];
+}
+
+export interface FrozenSpecificationReference {
+  specificationVersionId: string;
+  specificationVersion: number;
+  specificationHash: `sha256:${string}`;
+}
+
 export interface WorkspaceSummary {
   id: string;
   displayName: string;
