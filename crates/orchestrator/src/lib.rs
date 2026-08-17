@@ -1,6 +1,7 @@
 //! Trusted orchestration boundary for desktop commands.
 
 mod approval;
+mod context;
 mod domain;
 mod filesystem;
 mod persistence;
@@ -10,6 +11,7 @@ mod requirements;
 mod worktree;
 
 pub use approval::{ApprovalDecision, ApprovalGate, Operation, Risk};
+pub use context::*;
 pub use domain::*;
 pub use filesystem::WorkspaceFs;
 pub use persistence::{JsonStateStore, RecoveryCandidate, SqliteStateStore, StateStore};
