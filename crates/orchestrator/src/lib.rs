@@ -6,6 +6,7 @@ mod filesystem;
 mod persistence;
 mod process;
 mod recovery;
+mod requirements;
 mod worktree;
 
 pub use approval::{ApprovalDecision, ApprovalGate, Operation, Risk};
@@ -14,6 +15,7 @@ pub use filesystem::WorkspaceFs;
 pub use persistence::{JsonStateStore, RecoveryCandidate, SqliteStateStore, StateStore};
 pub use process::{ExecutionEnvironment, ProcessSpec, ProcessSupervisor, PtySize, SessionId};
 pub use recovery::{RecoveryRuntime, StartupRecovery, StartupRecoveryReport};
+pub use requirements::*;
 pub use worktree::{GitWorktreeService, WorktreeRequest};
 
 use thiserror::Error;

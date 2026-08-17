@@ -19,6 +19,27 @@ AgentHarbor has three deliberate trust and failure boundaries:
 The shared `packages/protocol` contract is the only interface visible to the
 UI. `packages/agent-adapters` converts vendor output into that contract.
 
+## Requirement specification lifecycle
+
+The lead agent begins intake with read-only repository analysis. Observed
+facts, explicitly labelled inferences, and de-duplicated questions are stored
+separately. Architecture-changing questions come first, followed by questions
+that change acceptance, then delivery details.
+
+Each requirement specification follows an OpenSpec-style structure: goal,
+background, in/out of scope, constraints, assumptions, user scenarios,
+acceptance criteria, risks, and open questions. The same content is stored as
+machine-readable database fields and as
+`.agentharbor/specs/<requirement-id>/v<version>.md` in the source repository.
+After user confirmation, freezing changes the immutable version's state and
+records a SHA-256 hash of the exact Markdown artifact.
+
+Execution plans, worker tasks, and final acceptance records copy both the
+frozen specification id and hash. A change creates a successor version rather
+than editing history; outstanding tasks are marked `review_required` until
+their impact is resolved. The event stream records analysis, version creation,
+and freezing for audit and recovery.
+
 ## Failure recovery
 
 The orchestrator writes workspace metadata, approvals, and session state using
